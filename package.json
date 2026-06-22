@@ -1,0 +1,73 @@
+{
+  "name": "@cch137/resilient-ws",
+  "version": "0.1.0",
+  "description": "Auto-reconnecting WebSocket client for Node and Deno — exponential backoff, send buffering, seamless soft-restart, and an inactivity watchdog for zombie connections.",
+  "license": "MIT",
+  "author": "cch137",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cch137/resilient-ws.git"
+  },
+  "homepage": "https://github.com/cch137/resilient-ws#readme",
+  "bugs": {
+    "url": "https://github.com/cch137/resilient-ws/issues"
+  },
+  "keywords": [
+    "websocket",
+    "ws",
+    "reconnect",
+    "reconnecting",
+    "reconnecting-websocket",
+    "resilient",
+    "auto-reconnect",
+    "backoff",
+    "exponential-backoff",
+    "heartbeat",
+    "watchdog",
+    "keepalive",
+    "buffer",
+    "realtime",
+    "stream",
+    "proxy-agent",
+    "typescript",
+    "node",
+    "deno",
+    "edge"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "DESIGN.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "release": "node bin/publish.mjs",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "peerDependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.0",
+    "tsdown": "^0.15.7",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3",
+    "ws": "^8.18.0"
+  }
+}

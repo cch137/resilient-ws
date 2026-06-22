@@ -1,0 +1,39 @@
+# CI for the public resilient-ws mirror (github.com/cch137/resilient-ws).
+#
+# This file lives under packages/resilient-ws/ in the source monorepo, so GitHub
+# does NOT run it there (workflows are only read from the repo-root .github/). It
+# travels with `git subtree push` and lands at the public repo root, where it
+# validates the package on every push and pull request: install, typecheck,
+# test, build, and a package (tarball) preview.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Package preview
+        run: npm pack --dry-run
