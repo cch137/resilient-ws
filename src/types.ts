@@ -6,7 +6,10 @@ import type { RawData } from "ws";
 import type { Agent as HttpAgent } from "node:http";
 import type { Agent as HttpsAgent } from "node:https";
 
-export type Sendable = string | ArrayBufferLike | Blob | ArrayBufferView;
+// Note: no `Blob` — the Node `ws` peer dependency's `send()` cannot serialise a
+// Blob (it throws at runtime). Convert to bytes (`await blob.arrayBuffer()`)
+// before sending.
+export type Sendable = string | ArrayBufferLike | ArrayBufferView;
 
 export interface ResilientWebSocketOptions {
   /**
@@ -74,25 +77,28 @@ export interface ReconnectInfo {
 /**
  * Parsed payload delivered by the `data` event.
  *
- * | `type`   | `data`      | When                                        |
- * |----------|-------------|---------------------------------------------|
- * | `"json"` | `unknown`   | Text frame whose content is valid JSON      |
- * | `"text"` | `string`    | Text frame that is not valid JSON           |
- * | `"binary"` | `Uint8Array` | Binary frame (`binaryType = "arraybuffer"`) |
- * | `"blob"` | `Blob`      | Binary frame (`binaryType = "blob"`)        |
+ * | `type`     | `data`       | When                                           |
+ * |------------|--------------|------------------------------------------------|
+ * | `"json"`   | `unknown`    | Text frame whose decoded content is valid JSON |
+ * | `"text"`   | `string`     | Text frame that is not valid JSON              |
+ * | `"binary"` | `Uint8Array` | Binary frame                                   |
  */
 export type DataPayload =
   | { type: "json"; data: unknown }
   | { type: "text"; data: string }
-  | { type: "binary"; data: Uint8Array }
-  | { type: "blob"; data: Blob };
+  | { type: "binary"; data: Uint8Array };
 
 export interface ResilientWebSocketEvents {
   /** The underlying socket opened successfully. */
   open: () => void;
   /** A message was received. */
   message: (event: RawData) => void;
-  /** The underlying socket emitted an error. Always followed by `close`. */
+  /**
+   * An error occurred. Either the underlying socket emitted one — in which case
+   * it is always followed by `close` — or resolving the `agent` option failed
+   * before a socket could open, in which case it is followed by a `reconnect`
+   * (or `exhausted`), not `close`, since no socket ever existed to close.
+   */
   error: (event: Error) => void;
   /** The underlying socket closed (whether or not a reconnect will follow). */
   close: (status: number) => void;

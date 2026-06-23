@@ -42,6 +42,55 @@ function defaultBackoff(attempt: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Frame helpers
+// ---------------------------------------------------------------------------
+
+const textDecoder = new TextDecoder();
+
+/**
+ * Normalise the various shapes `ws` can deliver a frame in
+ * (`Buffer` / `ArrayBuffer` / `Buffer[]` for fragmented messages) into a single
+ * `Uint8Array`. Typed-array inputs are returned as a zero-copy view; fragmented
+ * inputs are concatenated.
+ */
+function toUint8Array(raw: RawData): Uint8Array {
+  if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
+  if (Array.isArray(raw)) {
+    let total = 0;
+    for (const chunk of raw) total += chunk.byteLength;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of raw) {
+      out.set(
+        new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength),
+        offset,
+      );
+      offset += chunk.byteLength;
+    }
+    return out;
+  }
+  return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+}
+
+/**
+ * Like {@link toUint8Array} but guarantees the consumer owns the bytes.
+ *
+ * A fragmented (`Buffer[]`) frame is already concatenated into a fresh array by
+ * `toUint8Array`, so it is returned as-is — no second copy. A single `Buffer`
+ * (default nodebuffer mode) or an `ArrayBuffer` may be a view over `ws`'s reused
+ * socket read buffer, so its bytes are copied out before they can be overwritten
+ * by a later frame.
+ */
+function ownFrameBytes(raw: RawData): Uint8Array {
+  if (Array.isArray(raw)) return toUint8Array(raw);
+  return toUint8Array(raw).slice();
+}
+
+function asError(err: unknown): Error {
+  return err instanceof Error ? err : new Error(String(err));
+}
+
+// ---------------------------------------------------------------------------
 // ResilientWebSocket
 // ---------------------------------------------------------------------------
 
@@ -55,11 +104,17 @@ export class ResilientWebSocket {
   private readonly backoffFn: (attempt: number) => number;
   private readonly bufferWhileReconnecting: boolean;
   private readonly handshakeTimeoutMs: number;
+  private readonly agentOption:
+    | HttpAgent
+    | HttpsAgent
+    | ((
+        url: string,
+      ) => HttpAgent | HttpsAgent | Promise<HttpAgent | HttpsAgent>)
+    | undefined;
 
   // ── Socket state ─────────────────────────────────────────────────────────
 
   private ws: WebSocket | null = null;
-  private _agentPromise: Promise<HttpAgent | HttpsAgent> | null = null;
   private _openGeneration = 0;
   private attempt = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -92,13 +147,10 @@ export class ResilientWebSocket {
     this.backoffFn = options.backoff ?? defaultBackoff;
     this.bufferWhileReconnecting = options.bufferWhileReconnecting ?? true;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000;
-    if (options.agent !== undefined) {
-      const a = options.agent;
-      this._agentPromise =
-        typeof a === "function"
-          ? Promise.resolve(a(this.url))
-          : Promise.resolve(a);
-    }
+    // Stored (not pre-resolved) so a function factory is invoked per connection
+    // attempt — a transient failure can recover, and the URL is re-passed each
+    // time. Resolution errors are caught at the call site (see `_resolveAgent`).
+    this.agentOption = options.agent;
   }
 
   // ── Static factory ───────────────────────────────────────────────────────
@@ -153,9 +205,10 @@ export class ResilientWebSocket {
     this._exhausted = false;
     this._clearTimer();
     this._cancelPending();
+    // _detach() already terminates the current socket; bump the generation so
+    // any in-flight agent resolution from a prior _open() is discarded.
     this._detach();
     this._openGeneration++;
-    this.ws?.close(1000, "Restarting");
     this._open();
     return this;
   }
@@ -175,9 +228,15 @@ export class ResilientWebSocket {
   softRestart(): this {
     if (this._pendingWs || this._closing) return this;
     this._exhausted = false;
+    // Claim this soft restart synchronously. Agent resolution is async and
+    // `_pendingWs` is not set until it completes, so without a token a second
+    // call in the same tick would slip past the guard above and open a second,
+    // leaked socket. A later softRestart()/restart()/reconnect bumps the
+    // generation too, which cancels this now-stale in-flight soft open.
+    const gen = ++this._openGeneration;
 
     const doSoftOpen = (agent?: HttpAgent | HttpsAgent) => {
-      if (this._closing) return;
+      if (this._closing || this._openGeneration !== gen) return;
       const wsOpts: ClientOptions = {
         handshakeTimeout: this.handshakeTimeoutMs,
       };
@@ -186,7 +245,11 @@ export class ResilientWebSocket {
       this._pendingWs = pendingWs;
 
       pendingWs.on("open", () => {
-        if (this._pendingWs !== pendingWs) return; // cancelled by restart()
+        // Bail if cancelled by restart()/close() (_pendingWs cleared) or if the
+        // socket was closed while this pending handshake was still in flight —
+        // otherwise a soft restart that opens after close() would revive a live
+        // connection the caller believes is shut down.
+        if (this._pendingWs !== pendingWs || this._closing) return;
         this._pendingWs = null;
 
         this._detach();
@@ -208,11 +271,13 @@ export class ResilientWebSocket {
       pendingWs.on("error", () => {});
     };
 
-    if (this._agentPromise) {
-      this._agentPromise.then((agent) => doSoftOpen(agent));
-    } else {
-      doSoftOpen();
-    }
+    this._resolveAgent().then(
+      (agent) => doSoftOpen(agent),
+      () => {
+        // Agent resolution failed: keep the current socket and abort the soft
+        // restart silently, consistent with "new socket failed before opening".
+      },
+    );
 
     return this;
   }
@@ -229,6 +294,9 @@ export class ResilientWebSocket {
   close(code = 1000, reason = "Normal closure"): this {
     this._closing = true;
     this._clearTimer();
+    // Cancel any in-flight soft restart: without this, a pending socket that
+    // finishes its handshake after close() would resurrect a live connection.
+    this._cancelPending();
     this.ws?.close(code, reason);
     return this;
   }
@@ -396,19 +464,53 @@ export class ResilientWebSocket {
   private _open(): void {
     if (this._closing) return;
 
+    // A soft restart may have already swapped in a healthy socket while this
+    // reconnect sat in the backoff queue — bail rather than tear it down to
+    // open a duplicate. (restart() force-reopens by detaching first, so its
+    // socket is CLOSING/CLOSED here and this guard does not block it.)
+    if (this.ws !== null && this.ws.readyState < WebSocket.CLOSING) return;
+
+    // The active socket is down, so a soft restart's seamless-switchover
+    // premise no longer holds: cancel any still-pending soft socket and
+    // reconnect cleanly instead of racing two sockets to become active.
+    this._cancelPending();
+
     // Detach stale handlers from the previous socket to prevent a CLOSING
     // socket's onclose from firing and triggering a duplicate reconnect cycle.
     this._detach();
 
-    if (this._agentPromise) {
-      const gen = ++this._openGeneration;
-      this._agentPromise.then((agent) => {
+    if (this.agentOption === undefined) {
+      this._doOpen();
+      return;
+    }
+
+    const gen = ++this._openGeneration;
+    this._resolveAgent().then(
+      (agent) => {
         if (this._closing || this._openGeneration !== gen) return;
         this._doOpen(agent);
-      });
-    } else {
-      this._doOpen();
-    }
+      },
+      (err) => {
+        // Agent resolution failed (factory threw/rejected). Surface it and let
+        // the backoff loop retry instead of leaving the socket silently dead.
+        if (this._closing || this._openGeneration !== gen) return;
+        this._emit("error", asError(err));
+        this._scheduleReconnect();
+      },
+    );
+  }
+
+  /**
+   * Resolve the configured agent for a single connection attempt. A function
+   * factory is invoked fresh each call (deferred so a synchronous throw becomes
+   * a rejection rather than escaping the caller). Resolves to `undefined` when
+   * no agent is configured.
+   */
+  private _resolveAgent(): Promise<HttpAgent | HttpsAgent | undefined> {
+    const a = this.agentOption;
+    if (a === undefined) return Promise.resolve(undefined);
+    if (typeof a === "function") return Promise.resolve().then(() => a(this.url));
+    return Promise.resolve(a);
   }
 
   private _doOpen(agent?: HttpAgent | HttpsAgent): void {
@@ -436,35 +538,32 @@ export class ResilientWebSocket {
     this._attachActiveHandlers(ws);
   }
 
-  private _parseData(raw: unknown): DataPayload {
-    // Binary frame — arraybuffer mode (Deno default)
-    if (raw instanceof ArrayBuffer) {
-      return { type: "binary", data: new Uint8Array(raw) };
+  private _parseData(raw: RawData, isBinary: boolean): DataPayload {
+    // Trust the frame's opcode (ws passes `isBinary`) rather than the JS type
+    // of `raw`: with the default nodebuffer mode every frame — text or binary —
+    // arrives as a Buffer, so type sniffing alone cannot tell them apart.
+    if (isBinary) {
+      // ownFrameBytes copies only when the frame is a view over `ws`'s reused
+      // read buffer, so the consumer always owns the bytes without copying a
+      // freshly-concatenated fragmented frame twice. The `message` event still
+      // exposes the raw frame for callers that explicitly want zero-copy.
+      return { type: "binary", data: ownFrameBytes(raw) };
     }
 
-    // Binary frame — blob mode
-    if (raw instanceof Blob) {
-      return { type: "blob", data: raw };
+    // Text frame — decode the bytes, then attempt a JSON parse.
+    const text = textDecoder.decode(toUint8Array(raw));
+    try {
+      return { type: "json", data: JSON.parse(text) };
+    } catch {
+      return { type: "text", data: text };
     }
-
-    // Text frame — attempt JSON parse
-    if (typeof raw === "string") {
-      try {
-        return { type: "json", data: JSON.parse(raw) };
-      } catch {
-        return { type: "text", data: raw };
-      }
-    }
-
-    // Unexpected type (should not occur per the WS spec; treat as text)
-    return { type: "text", data: String(raw) };
   }
 
   private _attachActiveHandlers(ws: WebSocket): void {
-    ws.on("message", (data: RawData) => {
+    ws.on("message", (data: RawData, isBinary: boolean) => {
       if (this.ws !== ws) return;
       this._emit("message", data);
-      this._emit("data", this._parseData(data));
+      this._emit("data", this._parseData(data, isBinary));
     });
     ws.on("error", (error: Error) => {
       if (this.ws !== ws) return;

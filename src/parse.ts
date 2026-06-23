@@ -7,33 +7,38 @@ import type { DataPayload } from "./types.js";
 const textDecoder = new TextDecoder();
 
 /**
- * Parse a {@link DataPayload} (text / json / binary / blob) to its JSON value,
- * or `undefined` for empty / non-JSON frames.
+ * Parse a {@link DataPayload} (text / json / binary) to its JSON value, or
+ * `undefined` for empty or non-JSON frames.
  *
  * Convenience for feeds that always send JSON, regardless of whether the
- * transport delivered it as a text or binary frame:
+ * transport delivered it as a text or binary frame. A non-JSON frame yields
+ * `undefined` rather than throwing, so a stray control/heartbeat frame on the
+ * same socket is skipped instead of rejecting the handler:
  *
  * @example
- * ws.on("data", async (payload) => {
- *   const msg = await parseWsData(payload);
+ * ws.on("data", (payload) => {
+ *   const msg = parseWsData(payload);
  *   if (msg) handle(msg);
  * });
  */
-export async function parseWsData(payload: DataPayload): Promise<unknown> {
+export function parseWsData(payload: DataPayload): unknown {
   switch (payload.type) {
-    case "text": {
-      const text = payload.data.trim();
-      return text ? JSON.parse(text) : undefined;
-    }
     case "json":
       return payload.data;
-    case "binary": {
-      const text = textDecoder.decode(payload.data).trim();
-      return text ? JSON.parse(text) : undefined;
-    }
-    case "blob": {
-      const text = textDecoder.decode(await payload.data.arrayBuffer()).trim();
-      return text ? JSON.parse(text) : undefined;
-    }
+    case "text":
+      return tryParseJson(payload.data);
+    case "binary":
+      return tryParseJson(textDecoder.decode(payload.data));
+  }
+}
+
+/** JSON-parse a frame body; `undefined` for empty or malformed input. */
+function tryParseJson(raw: string): unknown {
+  const text = raw.trim();
+  if (!text) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
   }
 }

@@ -4,7 +4,7 @@ Auto-reconnecting WebSocket client for Node and Deno. Wraps [`ws`](https://githu
 with exponential-backoff reconnection, send buffering, a seamless soft-restart,
 and an inactivity watchdog that recovers *zombie* connections (a dead socket
 that never emits `close`). A small typed event emitter sits on top, plus a
-`data` event that pre-parses each frame to JSON/text/binary/blob.
+`data` event that pre-parses each frame to JSON/text/binary.
 
 Runs on Node ≥ 20 and Deno.
 
@@ -32,7 +32,7 @@ const ws = ResilientWebSocket.connect("wss://example.com/stream");
 
 ws.on("open", () => ws.send(JSON.stringify({ type: "subscribe", channel: "ticks" })));
 ws.on("data", (payload) => {
-  // payload is { type: "json" | "text" | "binary" | "blob", data }
+  // payload is { type: "json" | "text" | "binary", data }
   if (payload.type === "json") handle(payload.data);
 });
 ws.on("reconnect", ({ attempt, delayMs }) => console.log(`retry #${attempt} in ${delayMs}ms`));
@@ -46,8 +46,8 @@ flushed, in order, on the next open. Disable with `bufferWhileReconnecting: fals
 ```ts
 import { parseWsData } from "@cch137/resilient-ws";
 
-ws.on("data", async (payload) => {
-  const msg = await parseWsData(payload); // text/json/binary/blob → value | undefined
+ws.on("data", (payload) => {
+  const msg = parseWsData(payload); // text/json/binary → value | undefined (non-JSON skipped)
   if (msg) handle(msg);
 });
 ```
